@@ -16,7 +16,7 @@ import { ENV } from "./env";
 /* ============================
    ✅ FIX PARA __dirname EM ESM
 ============================ */
-const __filename = fileURLToPath(import.meta.url );
+const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 async function startServer() {
@@ -30,15 +30,22 @@ async function startServer() {
   app.use(
     cors({
       origin: (origin, callback) => {
-        // Dev: libera (útil para Vite + localhost)
+        // Dev: libera tudo
         if (!ENV.isProduction) return callback(null, true);
 
-        // Prod: restringe por origem (se definido). Sem origin (ex.: curl) pode permitir.
+        // Sem origin (ex.: curl)
         if (!origin) return callback(null, true);
 
-        const allowed = (ENV.webOrigin || "").split(",").map(s => s.trim()).filter(Boolean);
+        const allowed = (ENV.webOrigin || "")
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
+
         if (allowed.length === 0) return callback(null, true);
-        return allowed.includes(origin) ? callback(null, true) : callback(new Error("Not allowed by CORS"));
+
+        return allowed.includes(origin)
+          ? callback(null, true)
+          : callback(new Error("Not allowed by CORS"));
       },
       credentials: true,
     })
@@ -46,15 +53,17 @@ async function startServer() {
 
   app.use(cookieParser());
 
-  // ✅ Headers básicos de segurança (sem depender de libs externas)
+  // ✅ Headers básicos de segurança
   app.use((req, res, next) => {
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("X-Frame-Options", "DENY");
     res.setHeader("Referrer-Policy", "no-referrer");
-    res.setHeader("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
-    // Evita que assets sejam embutidos por outros sites
+    res.setHeader(
+      "Permissions-Policy",
+      "geolocation=(), microphone=(), camera=()"
+    );
     res.setHeader("Cross-Origin-Resource-Policy", "same-site");
-    // CSP mínima (não quebra Vite; ainda assim protege em PROD)
+
     if (ENV.isProduction) {
       res.setHeader(
         "Content-Security-Policy",
@@ -64,14 +73,17 @@ async function startServer() {
     next();
   });
 
-  // 🚨 OBRIGATÓRIO: JSON parser ANTES do tRPC (inclui batch)
+  // ✅ Parser global
   app.use(express.json({ limit: "2mb" }));
   app.use(express.urlencoded({ limit: "2mb", extended: true }));
 
   registerOAuthRoutes(app);
 
+  // 🔒 BLINDAGEM tRPC (correção do erro: expected object, received undefined)
   app.use(
     "/api/trpc",
+    express.json({ limit: "2mb" }),
+    express.urlencoded({ limit: "2mb", extended: true }),
     createExpressMiddleware({
       router: appRouter,
       createContext,
@@ -86,10 +98,7 @@ async function startServer() {
   } else {
     console.log("🚀 PROD: servindo frontend estático");
 
-    // ✅ CAMINHO CORRETO PARA O BUILD DO VITE
-    // Em produção, após o build, dist/index.js e dist/public/ estão no mesmo nível
     const frontendPath = path.resolve(__dirname, "./public");
-
     console.log("📁 Frontend path:", frontendPath);
 
     app.use(express.static(frontendPath));
