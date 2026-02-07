@@ -1,14 +1,20 @@
 import { trpc } from "@/lib/trpc";
 import { UNAUTHED_ERR_MSG } from "@shared/const";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { httpBatchLink, TRPCClientError } from "@trpc/client";
+import { httpLink, TRPCClientError } from "@trpc/client";
 import { createRoot } from "react-dom/client";
 import superjson from "superjson";
 import App from "./App";
 import "./index.css";
 
+// ===============================
+// React Query
+// ===============================
 const queryClient = new QueryClient();
 
+// ===============================
+// Tratamento global de erro
+// ===============================
 const handleApiError = (error: unknown) => {
   if (!(error instanceof TRPCClientError)) return;
   if (typeof window === "undefined") return;
@@ -18,7 +24,6 @@ const handleApiError = (error: unknown) => {
   if (isUnauthorized) {
     console.warn("[Auth] Sessão expirada ou inválida.");
 
-    // Evita loop: só manda pro login se já não estiver lá.
     if (window.location.pathname !== "/login") {
       console.log("[Auth] Redirecionando para login...");
       window.location.href = "/login";
@@ -42,15 +47,18 @@ queryClient.getMutationCache().subscribe((event) => {
   }
 });
 
+// ===============================
+// tRPC Client (SEM BATCH)
+// ===============================
 const baseUrl = window.location.origin || "http://localhost:3000";
 
 const trpcClient = trpc.createClient({
   transformer: superjson,
   links: [
-    httpBatchLink({
+    httpLink({
       url: `${baseUrl}/api/trpc`,
       fetch(input, init) {
-        return globalThis.fetch(input, {
+        return fetch(input, {
           ...(init ?? {}),
           credentials: "include",
         });
@@ -59,6 +67,9 @@ const trpcClient = trpc.createClient({
   ],
 });
 
+// ===============================
+// Render
+// ===============================
 createRoot(document.getElementById("root")!).render(
   <trpc.Provider client={trpcClient} queryClient={queryClient}>
     <QueryClientProvider client={queryClient}>
@@ -67,7 +78,9 @@ createRoot(document.getElementById("root")!).render(
   </trpc.Provider>
 );
 
+// ===============================
 // Service Worker (PWA)
+// ===============================
 if (import.meta.env.PROD && "serviceWorker" in navigator) {
   window.addEventListener("load", async () => {
     try {
