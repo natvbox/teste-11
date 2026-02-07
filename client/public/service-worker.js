@@ -1,152 +1,138 @@
 // Service Worker para PWA
 // Gerencia cache de recursos e funcionalidades offline
+//
+// OBJETIVO:
+// - NUNCA servir index.html antigo (isso congela bundle do Vite)
+// - NÃO tocar em /api (especialmente /api/trpc) para evitar bugs de payload/cookies
+// - Cache seguro para assets estáticos (JS/CSS/img/font), com atualização automática
 
-// IMPORTANTE:
-// - Evitar servir index.html antigo (isso “congela” o bundle antigo do Vite e causa bugs como payload undefined no login)
-// - Manter cache seguro para assets, mas sempre buscar a navegação pela rede
-// - Reduzir logs barulhentos no console
-
-const CACHE_NAME = 'notifique-me-v2';
-const RUNTIME_CACHE = 'notifique-me-runtime-v2';
+const CACHE_NAME = "notifique-me-v3";
+const RUNTIME_CACHE = "notifique-me-runtime-v3";
 
 // Se quiser debug do SW, altere para true.
 const DEBUG = false;
 
-// Recursos para cache na instalação
+// ✅ NÃO precache de "/" ou "/index.html"
+// Isso é o que mais congela deploy no Vite e gera “bugs fantasma”
 const PRECACHE_URLS = [
-  '/',
-  '/index.html',
-  '/manifest.json',
-  '/icon-192x192.png',
-  '/icon-512x512.png',
-  '/badge-72x72.png',
+  "/manifest.json",
+  "/icon-192x192.png",
+  "/icon-512x512.png",
+  "/badge-72x72.png",
 ];
 
 // Instalação do service worker
-self.addEventListener('install', (event) => {
-  if (DEBUG) console.log('[Service Worker] Instalando...');
-  
+self.addEventListener("install", (event) => {
+  if (DEBUG) console.log("[Service Worker] Instalando...");
+
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => {
-      if (DEBUG) console.log('[Service Worker] Fazendo cache de recursos');
+      if (DEBUG) console.log("[Service Worker] Fazendo cache de recursos");
       return cache.addAll(PRECACHE_URLS);
     })
   );
-  
+
   // Ativar imediatamente
   self.skipWaiting();
 });
 
 // Ativação do service worker
-self.addEventListener('activate', (event) => {
-  if (DEBUG) console.log('[Service Worker] Ativando...');
-  
+self.addEventListener("activate", (event) => {
+  if (DEBUG) console.log("[Service Worker] Ativando...");
+
   event.waitUntil(
-    caches.keys().then((cacheNames) => {
-      return Promise.all(
+    (async () => {
+      // Remove caches antigos
+      const cacheNames = await caches.keys();
+      await Promise.all(
         cacheNames
-          .filter((cacheName) => {
-            return cacheName !== CACHE_NAME && cacheName !== RUNTIME_CACHE;
-          })
-          .map((cacheName) => {
-            if (DEBUG) console.log('[Service Worker] Removendo cache antigo:', cacheName);
-            return caches.delete(cacheName);
+          .filter((name) => name !== CACHE_NAME && name !== RUNTIME_CACHE)
+          .map((name) => {
+            if (DEBUG) console.log("[Service Worker] Removendo cache antigo:", name);
+            return caches.delete(name);
           })
       );
-    })
+
+      // ✅ Limpa qualquer index.html antigo que tenha sido cacheado por versões antigas
+      const runtime = await caches.open(RUNTIME_CACHE);
+      await runtime.delete("/index.html");
+      await runtime.delete("/");
+      const precache = await caches.open(CACHE_NAME);
+      await precache.delete("/index.html");
+      await precache.delete("/");
+
+      // Tomar controle imediatamente
+      await self.clients.claim();
+
+      // Opcional: força recarregar todas as abas para pegar bundle novo
+      const clientsList = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+      clientsList.forEach((client) => client.postMessage({ type: "SW_ACTIVATED" }));
+    })()
   );
-  
-  // Tomar controle imediatamente
-  return self.clients.claim();
 });
 
 // Interceptar requisições
-self.addEventListener('fetch', (event) => {
+self.addEventListener("fetch", (event) => {
   const { request } = event;
   const url = new URL(request.url);
 
-  // ✅ Sempre buscar navegações pela rede para evitar index.html/bundle antigo.
-  // (Isso resolve bugs "fantasma" causados por cache do SW em deploys)
-  if (request.mode === 'navigate' || url.pathname === '/' || url.pathname === '/index.html') {
+  // Ignorar requisições não-HTTP
+  if (!url.protocol.startsWith("http")) return;
+
+  // ✅ NUNCA interceptar API (principalmente /api/trpc)
+  // Isso evita qualquer risco de body/cookies/sessão quebrar.
+  if (url.pathname.startsWith("/api/")) {
+    return; // deixa passar direto (network)
+  }
+
+  // ✅ Navegação (HTML) = NETWORK ONLY (com fallback offline opcional)
+  // Isso garante que o index.html SEMPRE vem atualizado do servidor.
+  const isNavigation =
+    request.mode === "navigate" ||
+    request.destination === "document" ||
+    url.pathname === "/" ||
+    url.pathname === "/index.html";
+
+  if (isNavigation) {
     event.respondWith(
-      fetch(request)
-        .then((response) => {
-          const responseClone = response.clone();
-          caches.open(CACHE_NAME).then((cache) => {
-            cache.put('/index.html', responseClone);
-          });
-          return response;
-        })
-        .catch(async () => {
-          const cached = await caches.match('/index.html');
-          return cached || caches.match(request);
-        })
+      fetch(request).catch(async () => {
+        // Fallback offline: tenta um HTML cacheado (se existir) — sem regravar index
+        const cached = await caches.match(request);
+        return cached || new Response("Offline", { status: 503, headers: { "Content-Type": "text/plain" } });
+      })
     );
     return;
   }
 
   // ✅ Cache API não suporta métodos diferentes de GET
-  if (request.method !== 'GET') {
-    event.respondWith(fetch(request));
-    return;
-  }
+  if (request.method !== "GET") return;
 
-  // Ignorar requisições não-HTTP
-  if (!url.protocol.startsWith('http')) {
-    return;
-  }
-
-  // Estratégia: Network First para API, Cache First para recursos estáticos
-  if (url.pathname.startsWith('/api/')) {
-    // Network First para API
-    event.respondWith(
-      fetch(request)
+  // Estratégia: Stale-While-Revalidate para assets estáticos
+  // - Serve rápido do cache
+  // - Atualiza em background (não fica preso em versão antiga)
+  event.respondWith(
+    caches.match(request).then((cachedResponse) => {
+      const fetchPromise = fetch(request)
         .then((response) => {
-          // Clonar resposta para cache
+          // Não cachear respostas inválidas
+          if (!response || response.status !== 200 || response.type === "error") return response;
+
           const responseClone = response.clone();
-          caches.open(RUNTIME_CACHE).then((cache) => {
-            cache.put(request, responseClone);
-          });
+          caches.open(RUNTIME_CACHE).then((cache) => cache.put(request, responseClone));
           return response;
         })
-        .catch(() => {
-          // Retornar do cache se offline
-          return caches.match(request);
-        })
-    );
-  } else {
-    // ✅ Stale-While-Revalidate para recursos estáticos
-    // - Serve rápido do cache
-    // - Atualiza em background para evitar ficar preso em versões antigas
-    event.respondWith(
-      caches.match(request).then((cachedResponse) => {
-        const fetchPromise = fetch(request)
-          .then((response) => {
-            // Não cachear respostas inválidas
-            if (!response || response.status !== 200 || response.type === 'error') {
-              return response;
-            }
+        .catch(() => cachedResponse);
 
-            const responseClone = response.clone();
-            caches.open(RUNTIME_CACHE).then((cache) => {
-              cache.put(request, responseClone);
-            });
-
-            return response;
-          })
-          .catch(() => cachedResponse);
-
-        return cachedResponse || fetchPromise;
-      })
-    );
-  }
+      return cachedResponse || fetchPromise;
+    })
+  );
 });
 
 // Sincronização em background
-self.addEventListener('sync', (event) => {
-  if (DEBUG) console.log('[Service Worker] Sincronização em background:', event.tag);
-  
-  if (event.tag === 'sync-notifications') {
+self.addEventListener("sync", (event) => {
+  if (DEBUG) console.log("[Service Worker] Sincronização em background:", event.tag);
+
+  if (event.tag === "sync-notifications") {
     event.waitUntil(syncNotifications());
   }
 });
@@ -154,122 +140,88 @@ self.addEventListener('sync', (event) => {
 // Função para sincronizar notificações
 async function syncNotifications() {
   try {
-    // Implementar lógica de sincronização
-    if (DEBUG) console.log('[Service Worker] Sincronizando notificações...');
-    
-    // Buscar notificações pendentes do IndexedDB
-    // Enviar para o servidor
-    // Atualizar status local
-    
+    if (DEBUG) console.log("[Service Worker] Sincronizando notificações...");
     return Promise.resolve();
   } catch (error) {
-    console.error('[Service Worker] Erro ao sincronizar:', error);
+    console.error("[Service Worker] Erro ao sincronizar:", error);
     return Promise.reject(error);
   }
 }
 
 // Listener para mensagens do cliente
-self.addEventListener('message', (event) => {
-  // Evita spam no console em produção.
-  if (DEBUG) console.log('[Service Worker] Mensagem recebida:', event.data);
-  
-  if (event.data && event.data.type === 'SKIP_WAITING') {
+self.addEventListener("message", (event) => {
+  if (DEBUG) console.log("[Service Worker] Mensagem recebida:", event.data);
+
+  if (event.data && event.data.type === "SKIP_WAITING") {
     self.skipWaiting();
   }
-  
-  if (event.data && event.data.type === 'CACHE_URLS') {
+
+  if (event.data && event.data.type === "CACHE_URLS") {
     event.waitUntil(
-      caches.open(RUNTIME_CACHE).then((cache) => {
-        return cache.addAll(event.data.urls);
-      })
+      caches.open(RUNTIME_CACHE).then((cache) => cache.addAll(event.data.urls))
     );
   }
-  
-  if (event.data && event.data.type === 'CLEAR_CACHE') {
+
+  if (event.data && event.data.type === "CLEAR_CACHE") {
     event.waitUntil(
-      caches.keys().then((cacheNames) => {
-        return Promise.all(
-          cacheNames.map((cacheName) => caches.delete(cacheName))
-        );
-      })
+      caches.keys().then((cacheNames) => Promise.all(cacheNames.map((name) => caches.delete(name))))
     );
   }
 });
 
 // Push notification listener
-self.addEventListener('push', (event) => {
-  if (DEBUG) console.log('[Service Worker] Push recebido:', event);
-  
+self.addEventListener("push", (event) => {
+  if (DEBUG) console.log("[Service Worker] Push recebido:", event);
+
   let data = {};
-  
   if (event.data) {
     try {
       data = event.data.json();
     } catch (e) {
-      data = { title: 'Nova Notificação', body: event.data.text() };
+      data = { title: "Nova Notificação", body: event.data.text() };
     }
   }
-  
-  const title = data.title || 'Notifique-me';
+
+  const title = data.title || "Notifique-me";
   const options = {
-    body: data.body || '',
-    icon: data.icon || '/icon-192x192.png',
-    badge: '/badge-72x72.png',
+    body: data.body || "",
+    icon: data.icon || "/icon-192x192.png",
+    badge: "/badge-72x72.png",
     image: data.image,
     data: data.data || {},
-    tag: data.tag || 'default',
+    tag: data.tag || "default",
     requireInteraction: false,
     actions: [
-      {
-        action: 'open',
-        title: 'Abrir',
-      },
-      {
-        action: 'close',
-        title: 'Fechar',
-      },
+      { action: "open", title: "Abrir" },
+      { action: "close", title: "Fechar" },
     ],
   };
-  
-  event.waitUntil(
-    self.registration.showNotification(title, options)
-  );
+
+  event.waitUntil(self.registration.showNotification(title, options));
 });
 
 // Notification click listener
-self.addEventListener('notificationclick', (event) => {
-  if (DEBUG) console.log('[Service Worker] Notificação clicada:', event);
-  
+self.addEventListener("notificationclick", (event) => {
+  if (DEBUG) console.log("[Service Worker] Notificação clicada:", event);
+
   event.notification.close();
-  
-  const { action, notification } = event;
-  const data = notification.data;
-  
-  if (action === 'close') {
-    return;
-  }
-  
-  const urlToOpen = data.url || '/';
-  
+
+  if (event.action === "close") return;
+
+  const urlToOpen = (event.notification.data && event.notification.data.url) || "/";
+
   event.waitUntil(
-    clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clientList) => {
-      // Procurar janela já aberta
+    clients.matchAll({ type: "window", includeUncontrolled: true }).then((clientList) => {
       for (let i = 0; i < clientList.length; i++) {
         const client = clientList[i];
-        if (client.url === urlToOpen && 'focus' in client) {
-          return client.focus();
-        }
+        if (client.url === urlToOpen && "focus" in client) return client.focus();
       }
-      
-      // Abrir nova janela
-      if (clients.openWindow) {
-        return clients.openWindow(urlToOpen);
-      }
+      if (clients.openWindow) return clients.openWindow(urlToOpen);
     })
   );
 });
 
 // Notification close listener
-self.addEventListener('notificationclose', (event) => {
-  console.log('[Service Worker] Notificação fechada:', event);
+self.addEventListener("notificationclose", (event) => {
+  if (DEBUG) console.log("[Service Worker] Notificação fechada:", event);
 });
