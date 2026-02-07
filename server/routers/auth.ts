@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { router, publicProcedure, protectedProcedure } from "../_core/trpc";
 import { sdk } from "../_core/sdk";
-import { getUserByOpenId, upsertUser } from "../db";
+import { getUserByOpenId, upsertUser, getDb } from "../db";
 import { ENV } from "../_core/env";
 import { TRPCError } from "@trpc/server";
 import {
@@ -11,7 +11,6 @@ import {
   verifyPassword,
 } from "../_core/password";
 import { COOKIE_NAME } from "@shared/const";
-import { getDb } from "../db";
 import { deliveries } from "../../drizzle/schema";
 import { eq, sql } from "drizzle-orm";
 
@@ -36,11 +35,11 @@ function clearCookie(name: string) {
 export const authRouter = router({
   /**
    * Login local (SEM dependências externas): usuário + senha.
-   * - openId pode ser loginId ou email
+   * - loginId pode ser um login (sem @) ou e-mail
    * - Se o usuário não tem senha definida, o 1º login define a senha
    *
    * ⚠️ IMPORTANTE:
-   * Seu banco usa snake_case. A coluna correta é: password_hash
+   * A coluna no banco é: password_hash
    */
   login: publicProcedure
     .input(
@@ -62,6 +61,7 @@ export const authRouter = router({
             "Usuário inválido. Use um login (letras/números e ; . _ -) ou um e-mail válido",
         });
       }
+
       if (!isValidPassword(input.password)) {
         throw new TRPCError({
           code: "BAD_REQUEST",
@@ -72,20 +72,23 @@ export const authRouter = router({
       const existing: any = await getUserByOpenId(openId);
       const now = new Date();
 
-      // ✅ Lê a senha do banco no formato snake_case
+      // ✅ senha no banco (snake_case)
       const storedHash: string | undefined =
         existing?.password_hash ?? existing?.passwordHash ?? undefined;
 
       if (storedHash) {
         const ok = verifyPassword(input.password, storedHash);
-        if (!ok)
-          throw new TRPCError({ code: "UNAUTHORIZED", message: "Usuário ou senha incorretos" });
+        if (!ok) {
+          throw new TRPCError({
+            code: "UNAUTHORIZED",
+            message: "Usuário ou senha incorretos",
+          });
+        }
       }
 
-      // Se não existir ou não tiver senha definida, define a senha no 1º login.
+      // Se não existir hash, define no 1º login
       const newHash = storedHash ? undefined : hashPassword(input.password);
 
-      // ✅ Grava no banco no formato snake_case: password_hash
       await upsertUser({
         openId,
         name: input.name ?? existing?.name ?? null,
@@ -96,8 +99,7 @@ export const authRouter = router({
       } as any);
 
       const token = await sdk.createSessionToken(openId);
-      const header = buildCookie(cookieName, token, 60 * 60 * 24 * 30);
-      ctx.res.setHeader("Set-Cookie", header);
+      ctx.res.setHeader("Set-Cookie", buildCookie(cookieName, token, 60 * 60 * 24 * 30));
 
       return { success: true };
     }),
@@ -110,6 +112,7 @@ export const authRouter = router({
 
   me: protectedProcedure.query(async ({ ctx }) => {
     let hasInbox: boolean | undefined = undefined;
+
     if (ctx.user?.role === "admin") {
       const db = await getDb();
       if (db) {
@@ -121,6 +124,7 @@ export const authRouter = router({
         hasInbox = Number(res?.[0]?.c ?? 0) > 0;
       }
     }
+
     return { user: { ...ctx.user, hasInbox } };
   }),
 });
