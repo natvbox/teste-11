@@ -65,9 +65,17 @@ async function startServer() {
     res.setHeader("Cross-Origin-Resource-Policy", "same-site");
 
     if (ENV.isProduction) {
+      // ✅ CSP ajustado para permitir Google Fonts
       res.setHeader(
         "Content-Security-Policy",
-        "default-src 'self'; img-src 'self' data: https:; media-src 'self' https:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' https:; frame-ancestors 'none'"
+        "default-src 'self'; " +
+          "img-src 'self' data: https:; " +
+          "media-src 'self' https:; " +
+          "script-src 'self' 'unsafe-inline'; " +
+          "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
+          "font-src 'self' https://fonts.gstatic.com data:; " +
+          "connect-src 'self' https:; " +
+          "frame-ancestors 'none'"
       );
     }
     next();
@@ -79,7 +87,8 @@ async function startServer() {
 
   registerOAuthRoutes(app);
 
-  // 🔒 BLINDAGEM tRPC (correção do erro: expected object, received undefined)
+  // 🔒 tRPC
+  // ✅ allowBatching: true (necessário se o frontend usa httpBatchLink)
   app.use(
     "/api/trpc",
     express.json({ limit: "2mb" }),
@@ -87,6 +96,7 @@ async function startServer() {
     createExpressMiddleware({
       router: appRouter,
       createContext,
+      allowBatching: true, // ✅ CORREÇÃO PRINCIPAL
     })
   );
 
